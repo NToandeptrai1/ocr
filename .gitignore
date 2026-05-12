@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Project specific
+ocr/captures/
+ocr/.tb_token
+esp32_cam/build/
+
+# OS
+.DS_Store
+Thumbs.db
