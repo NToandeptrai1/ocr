@@ -40,13 +40,18 @@ TOKEN_FILE = Path(__file__).parent / ".tb_token"
 ESP32_IP = "192.168.0.132"
 
 active_client = None
+
 is_ota_processing = False
 last_ota_version = None
 
 # ── Xu ly OTA ─────────────────────────────────────────────────────────────
-def process_ota(token, fw_title, fw_version):
+def process_ota(token, fw_title, fw_version, fw_checksum="", fw_checksum_algorithm=""):
     global active_client, is_ota_processing, last_ota_version
     
+    if active_client is None or not active_client.is_connected:
+        print(f"[OTA] Dang cho ket noi MQTT de bat dau...")
+        return
+
     if is_ota_processing or fw_version == last_ota_version:
         return
         
@@ -64,22 +69,67 @@ def process_ota(token, fw_title, fw_version):
         
         if resp.status_code == 200:
             fw_data = resp.content
-            print(f"[OTA] 2/3: Tai xong {len(fw_data)} bytes. Dang ban xuong ESP32...")
+            print(f"[OTA] 2/3: Tai xong {len(fw_data)} bytes.")
+            
+            import hashlib
+            
+            # 1. Kiem tra file voi ThingsBoard (Ho tro MD5 va SHA256)
+            if fw_checksum:
+                algo = fw_checksum_algorithm.upper() if fw_checksum_algorithm else "MD5"
+                if "SHA256" in algo or "SHA-256" in algo:
+                    calc_hash = hashlib.sha256(fw_data).hexdigest()
+                else:
+                    calc_hash = hashlib.md5(fw_data).hexdigest()
+                    
+                if calc_hash != fw_checksum:
+                    print(f"[OTA] [!] LOI BAO MAT: Checksum khong khop! (Mong muon: {fw_checksum}, Thuc te: {calc_hash})")
+                    active_client.client.publish("v1/devices/me/telemetry", json.dumps({"fw_state": "FAILED"}))
+                    is_ota_processing = False
+                    return
+                print(f"[OTA] [*] File chuan tu ThingsBoard (Verified {algo}).")
+            
+            # 2. Tach chu ky so tu cuoi file
+            clean_data = fw_data
+            signature_hex = ""
+            if len(fw_data) > 2:
+                sig_len = int.from_bytes(fw_data[-2:], byteorder='big')
+                if 60 <= sig_len <= 80 and len(fw_data) > sig_len + 2:
+                    signature_bytes = fw_data[-(sig_len + 2):-2]
+                    signature_hex = signature_bytes.hex()
+                    clean_data = fw_data[:-(sig_len + 2)]
+                    print(f"[OTA] [*] Da phat hien chu ky so: {signature_hex[:16]}... ({sig_len} bytes)")
+                else:
+                    print(f"[OTA] [!] CANH BAO: Khong phat hien chu ky so hop le o cuoi file!")
+            
+            # 3. Tinh MD5 cua clean binary de bao ve truyen dan Python -> ESP32
+            esp_md5 = hashlib.md5(clean_data).hexdigest()
+            print(f"[OTA] Dang ban xuong ESP32 (Kem ma bao ve MD5: {esp_md5[:8]}...).")
+
+            time.sleep(5) 
+        
             
             # Report UPDATING
             active_client.client.publish("v1/devices/me/telemetry", json.dumps({"fw_state": "UPDATING"}))
             
-            # 3. Push to ESP32
+            # 4. Push to ESP32
             esp_url = f"http://{ESP32_IP}/update"
-            files = {'image': ('firmware.bin', fw_data, 'application/octet-stream')}
-            esp_resp = requests.post(esp_url, files=files, timeout=60)
+            files = {'image': ('firmware.bin', clean_data, 'application/octet-stream')}
+            
+            headers = {
+                'Connection': 'close',
+                'X-MD5': esp_md5,
+                'X-Signature': signature_hex,
+                'X-Auth-Token': token
+            }
+                
+            esp_resp = requests.post(esp_url, files=files, timeout=300, headers=headers)  
             
             if esp_resp.status_code == 200 and "OK" in esp_resp.text:
                 print("[OTA] 3/3: ESP32 xac nhan thanh cong! Dang reboot...")
                 active_client.client.publish("v1/devices/me/telemetry", json.dumps({"fw_state": "UPDATED"}))
                 last_ota_version = fw_version
             else:
-                print(f"[OTA] [!] ESP32 bao loi: {esp_resp.text}")
+                print(f"[OTA] [!] ESP32 bao loi: {esp_resp.status_code} - {esp_resp.text}")
                 active_client.client.publish("v1/devices/me/telemetry", json.dumps({"fw_state": "FAILED"}))
         else:
             print(f"[OTA] [!] Loi tai file: HTTP {resp.status_code}")
@@ -129,7 +179,7 @@ class TBClient:
             self.client.subscribe("v1/devices/me/attributes/response/+")
             
             # Pull current OTA info immediately
-            payload = {"sharedKeys": "fw_title,fw_version,fw_tag,target_fw_title,target_fw_version,target_fw_tag"}
+            payload = {"sharedKeys": "fw_title,fw_version,fw_tag,target_fw_title,target_fw_version,target_fw_tag,fw_checksum,target_fw_checksum,fw_checksum_algorithm,target_fw_checksum_algorithm"}
             self.client.publish("v1/devices/me/attributes/request/1", json.dumps(payload))
         else:
             self.is_connected = False
@@ -139,13 +189,15 @@ class TBClient:
             data = json.loads(msg.payload.decode('utf-8'))
             attr_data = data.get("shared", data)
             
-            fw_keys = ["fw_title", "fw_version", "fw_tag", "target_fw_title", "target_fw_version", "target_fw_tag"]
+            fw_keys = ["fw_title", "fw_version", "fw_tag", "target_fw_title", "target_fw_version", "target_fw_tag", "fw_checksum", "target_fw_checksum", "fw_checksum_algorithm", "target_fw_checksum_algorithm"]
             if any(k in attr_data for k in fw_keys):
                 fw_title = attr_data.get("target_fw_title") or attr_data.get("fw_title") or attr_data.get("target_fw_tag") or "Firmware"
                 fw_version = attr_data.get("target_fw_version") or attr_data.get("fw_version") or attr_data.get("target_fw_tag")
+                fw_checksum = attr_data.get("target_fw_checksum") or attr_data.get("fw_checksum") or ""
+                fw_algo = attr_data.get("target_fw_checksum_algorithm") or attr_data.get("fw_checksum_algorithm") or ""
                 
                 if fw_version:
-                    threading.Thread(target=process_ota, args=(USER_NAME, fw_title, fw_version), daemon=True).start()
+                    threading.Thread(target=process_ota, args=(USER_NAME, fw_title, fw_version, fw_checksum, fw_algo), daemon=True).start()
         except: pass
 
     def connect(self):
@@ -166,7 +218,8 @@ def get_device_info():
     except: return ""
 
 def main():
-    global active_client, USER_NAME
+    
+    global active_client, USER_NAME, is_ota_processing
     print("\n" + "="*50)
     print("      SYSTEM STARTING... (OTA GATEWAY ENABLED)")
     print("="*50)
@@ -207,9 +260,15 @@ def main():
     frame = 0
     print("\n[*] Monitoring started (Cycle: 5s)")
     while True:
+        if is_ota_processing:
+            print("[DEBUG] Dang co OTA, tam dung Monitoring 10s...")
+            time.sleep(10)
+            continue
+
         loop_start = time.time()
         frame += 1
         img_data = None
+
         
         try:
             with urllib.request.urlopen(f"http://{ESP32_IP}/capture", timeout=10) as r: 
@@ -228,17 +287,24 @@ def main():
             try: results = extract_text(str(path), lang="vi", return_dict=False)
             except: pass
             
+            ocr_text = " ".join(results) if results else ""
             product_id = "UNKNOWN"
             if results:
                 matches = re.findall(r'[A-Z0-9-]{4,}', " ".join(results))
                 product_id = matches[0] if matches else "UNKNOWN"
             
-            print(f"[#{frame}] Captured   : {product_id}")
+            print(f"[#{frame}] Image: {img_filename} | OCR: {product_id}")
             
             # Telemetry
             b64_str = base64.b64encode(img_data).decode('utf-8')
+            now = time.strftime("%H:%M:%S", time.localtime())
+            
             payload = {
+                "sequence": frame,
                 "product_id": product_id,
+                "ocr_text": ocr_text,       # <--- Thêm toàn bộ văn bản quét được
+                "image_name": img_filename,
+                "processed_at": now,
                 "timestamp": int(time.time() * 1000),
                 "image_base64": f"data:image/jpeg;base64,{b64_str}"
             }

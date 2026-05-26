@@ -20,6 +20,9 @@
 #include <Update.h>               // OTA Update
 #include <Preferences.h>          // Luu token vao NVS flash
 #include <ArduinoJson.h>          // Parse JSON response
+#include "mbedtls/sha256.h"
+#include "mbedtls/pk.h"
+#include "mbedtls/error.h"
 
 // Select camera model
 //#define CAMERA_MODEL_WROVER_KIT
@@ -37,7 +40,7 @@
 #define TB_PROV_KEY     "9lymllsggh4lqmb49qlo"
 #define TB_PROV_SECRET  "ncr0x82zx8fcpqhid2a3"
 // Device name = "ESP32-CAM-" + MAC (6 hex chars) de dam bao duy nhat
-String TB_DEVICE_NAME = "ESP32-CAM1-";
+String TB_DEVICE_NAME = "ESP32-CAM6-";
 
 // ── Capture interval ─────────────────────────────────────────────────────────
 #define CAPTURE_INTERVAL_MS 5000
@@ -52,6 +55,28 @@ unsigned long lastHeartbeat = 0;
 
 String tbToken = "";   // ThingsBoard access token (loaded from NVS or provisioned)
 volatile bool provisionResponseReceived = false;
+volatile bool is_ota_authorized = true;
+mbedtls_sha256_context sha_ctx;
+bool sha_ctx_initialized = false;
+
+// Public key for OTA signature verification (ECDSA secp256r1)
+const char* ota_public_key = 
+"-----BEGIN PUBLIC KEY-----\n"
+"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQyqb0Pa+Q+sfM0Ad5/gUikdD3CVi\n"
+"jhYgx/9ajw0yc+1g37U3bfhTzJR1ZsovfR4bXv6Rz5kiSj35icy8GoHJrA==\n"
+"-----END PUBLIC KEY-----\n";
+
+// Convert Hex string to byte array
+size_t hex_to_bytes(const String& hex, uint8_t* bytes, size_t max_len) {
+  size_t len = hex.length();
+  size_t byte_len = len / 2;
+  if (byte_len > max_len) byte_len = max_len;
+  for (size_t i = 0; i < byte_len; i++) {
+    String part = hex.substring(i * 2, i * 2 + 2);
+    bytes[i] = (uint8_t) strtol(part.c_str(), NULL, 16);
+  }
+  return byte_len;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HTTP helpers
@@ -141,22 +166,120 @@ void handle_info()
 // /update - HTTP OTA endpoint
 void handle_update_post() {
   server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-  ESP.restart();
+  if (!is_ota_authorized || Update.hasError()) {
+    server.send(400, "text/plain", "FAIL");
+  } else {
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
+  }
 }
 
 void handle_update_upload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
     Serial.printf("[OTA] Update Start: %s\n", upload.filename.c_str());
+    
+    // 1. Xác thực Token trước khi làm bất kỳ việc gì
+    is_ota_authorized = true;
+    if (tbToken.length() > 0) {
+      String client_token = server.hasHeader("X-Auth-Token") ? server.header("X-Auth-Token") : "";
+      if (client_token != tbToken) {
+        Serial.println("[OTA] [!] SECURITY ERROR: Authorization token is invalid!");
+        is_ota_authorized = false;
+        Update.abort();
+        return;
+      }
+    }
+    Serial.println("[OTA] Authorization verified.");
+
+    // TAT CAMERA truoc khi ghi Flash de tranh xung dot bo nho (DMA Crash)
+    esp_camera_deinit();
+    Serial.println("[OTA] Da tat Camera. Chuan bi ghi Flash...");
+    
+    if (server.hasHeader("X-MD5")) {
+      String expected_md5 = server.header("X-MD5");
+      Update.setMD5(expected_md5.c_str());
+      Serial.println("[OTA] Bao mat MD5 duoc BAT: " + expected_md5);
+    } else {
+      Serial.println("[OTA] CANH BAO: Khong co ma bao ve MD5!");
+    }
+
+    // Khởi tạo SHA-256 on-the-fly
+    mbedtls_sha256_init(&sha_ctx);
+    mbedtls_sha256_starts(&sha_ctx, 0); // 0 means SHA-256
+    sha_ctx_initialized = true;
+    Serial.println("[OTA] SHA-256 initialized on-the-fly.");
+
     if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!is_ota_authorized) return;
+    
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
     }
+    
+    if (sha_ctx_initialized) {
+      mbedtls_sha256_update(&sha_ctx, (const unsigned char*)upload.buf, upload.currentSize);
+    }
   } else if (upload.status == UPLOAD_FILE_END) {
+    if (!is_ota_authorized) {
+      return;
+    }
+    
+    uint8_t hash[32];
+    if (sha_ctx_initialized) {
+      mbedtls_sha256_finish(&sha_ctx, hash);
+      mbedtls_sha256_free(&sha_ctx);
+      sha_ctx_initialized = false;
+      
+      Serial.print("[OTA] Calculated SHA-256: ");
+      for (int i = 0; i < 32; i++) {
+        Serial.printf("%02x", hash[i]);
+      }
+      Serial.println();
+    }
+
+    // Xác thực chữ ký số bằng Public Key (ECDSA)
+    if (server.hasHeader("X-Signature")) {
+      String sig_hex = server.header("X-Signature");
+      uint8_t signature[128];
+      size_t sig_len = hex_to_bytes(sig_hex, signature, sizeof(signature));
+      
+      Serial.printf("[OTA] Verifying signature (Length: %d bytes)...\n", sig_len);
+      
+      mbedtls_pk_context pk;
+      mbedtls_pk_init(&pk);
+      
+      int ret = mbedtls_pk_parse_public_key(&pk, (const unsigned char*)ota_public_key, strlen(ota_public_key) + 1);
+      if (ret != 0) {
+        Serial.printf("[OTA] [!] Failed to parse public key: -0x%04X\n", -ret);
+        Update.abort();
+        mbedtls_pk_free(&pk);
+        is_ota_authorized = false;
+        return;
+      }
+      
+      ret = mbedtls_pk_verify(&pk, MBEDTLS_MD_SHA256, hash, 32, signature, sig_len);
+      mbedtls_pk_free(&pk);
+      
+      if (ret == 0) {
+        Serial.println("[OTA] [*] SECURE: Signature verified successfully!");
+      } else {
+        Serial.printf("[OTA] [!] SECURITY ERROR: Signature verification failed: -0x%04X\n", -ret);
+        Update.abort();
+        is_ota_authorized = false;
+        return;
+      }
+    } else {
+      Serial.println("[OTA] [!] SECURITY ERROR: X-Signature header is missing!");
+      Update.abort();
+      is_ota_authorized = false;
+      return;
+    }
+
     if (Update.end(true)) {
       Serial.printf("[OTA] Update Success: %u bytes\n", upload.totalSize);
     } else {
@@ -246,7 +369,7 @@ String tbProvision()
 void setup()
 {
   Serial.begin(115200);
-  Serial.println("\n[ESP32] Booting v2.0...");
+  Serial.println("\n[ESP32] Booting v3.0...");
 
   // ── Camera init ──────────────────────────────────────────
   camera_config_t config;
@@ -270,7 +393,7 @@ void setup()
   config.pin_reset     = RESET_GPIO_NUM;
   config.xclk_freq_hz  = 20000000;
   config.pixel_format  = PIXFORMAT_JPEG;
-  config.frame_size    = FRAMESIZE_SVGA; // 800x600 - Tot nhat cho OCR va WiFi
+  config.frame_size    = FRAMESIZE_QVGA; // 800x600 - Tot nhat cho OCR va WiFi
   config.jpeg_quality  = 10;           // Chat luong tot (1-63, so cang thap cang net)
   config.fb_count      = 2;
 
@@ -303,6 +426,10 @@ void setup()
   Serial.println(WiFi.localIP());
   Serial.print("[WiFi] SSID: ");
   Serial.println(WiFi.SSID());
+
+  // Giam cong suat phat WiFi de chong sap nguon (Brownout) khi OTA
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  Serial.println("[WiFi] TX Power reduced to save power.");
 
   // Tao device name duy nhat dua tren MAC address
   uint8_t mac[6];
@@ -337,10 +464,13 @@ void setup()
   server.on("/capture", HTTP_GET, handle_capture);
   server.on("/info",    HTTP_GET, handle_info);
   
-  // OTA Update Endpoints
   server.on("/update", HTTP_POST, handle_update_post, handle_update_upload);
 
   server.onNotFound(handleNotFound);
+
+  const char* headerKeys[] = {"X-MD5", "X-Signature", "X-Auth-Token"};
+  server.collectHeaders(headerKeys, 3);
+
   server.begin();
 
   Serial.println("[ESP32] Web server started");
